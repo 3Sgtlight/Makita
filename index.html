@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Quiz por Pose - Makita</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      background-color: #f7f7f7;
+    }
+    h1 { margin-bottom: 5px; }
+    #question-container {
+      margin: 20px;
+      font-size: 1.5em;
+      font-weight: bold;
+      transition: opacity 0.5s ease-in-out;
+    }
+    #canvas {
+      border: 1px solid #ccc;
+      margin-top: 10px;
+    }
+    #feedback {
+      margin-top: 20px;
+      font-size: 1.2em;
+      color: darkgreen;
+    }
+    #label-container {
+      font-size: 0.9em;
+      margin-top: 10px;
+      color: #444;
+    }
+    #progress-bar-container {
+      width: 80%;
+      margin: 20px auto;
+      height: 20px;
+      background-color: #ddd;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    #progress-bar {
+      height: 100%;
+      width: 0%;
+      background-color: #2e8b57;
+      transition: width 0.5s ease;
+    }
+    #popup {
+      display: none;
+      position: fixed;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      background-color: #fff;
+      border: 2px solid #333;
+      padding: 30px;
+      z-index: 1000;
+      box-shadow: 0 0 20px rgba(0,0,0,0.3);
+      width: 80%;
+      max-width: 400px;
+    }
+    #popup h2 { margin-bottom: 15px; }
+    #popup p { margin-bottom: 20px; }
+    #popup button {
+      padding: 10px 20px;
+      font-size: 1em;
+      background-color: #2e8b57;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    #popup button:hover { background-color: #246b45; }
+    #overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: rgba(0,0,0,0.5);
+      z-index: 999;
+    }
+  </style>
+</head>
+<body>
+  <h1>Você é uma Esmerilhadeira?</h1>
+  <div id="question-counter"></div>
+  <div id="question-container">Carregando pergunta...</div>
+
+  <div id="progress-bar-container">
+    <div id="progress-bar"></div>
+  </div>
+
+  <button id="start-btn" onclick="init()">Iniciar Webcam</button>
+  <canvas id="canvas"></canvas>
+  <div id="feedback"></div>
+  <div id="label-container"></div>
+
+  <div id="overlay"></div>
+  <div id="popup">
+    <h2 id="popup-title"></h2>
+    <p id="popup-message"></p>
+    <button onclick="restartQuiz()">Refazer o Quiz</button>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/pose@0.8/dist/teachablemachine-pose.min.js"></script>
+
+  <script>
+    const URL = "./my_model/";
+    let model, webcam, ctx, labelContainer, maxPredictions;
+    let canvasEl;
+
+    let questionIndex = 0;
+    let positiveAnswers = 0;
+    let negativeAnswers = 0;
+    let lastDetectedAnswer = null;
+    let timerId = null;
+    const answersDuringTimer = [];
+
+    const TRANSITION_TIME_MS = 3000;
+    const CONFIDENCE_THRESHOLD = 0.51;
+
+    let CLASS_SIM = null;
+    let CLASS_NAO = null;
+
+    const questions = [
+      { text: "Você precisa de energia para funcionar?" },
+      { text: "Você é multifunção?" },
+      { text: "Você gosta de polir materiais?" },
+      { text: "Você gosta de Makita?" },
+      { text: "Você gosta de construção civil?" }
+    ];
+
+    async function init() {
+      document.getElementById("start-btn").disabled = true;
+
+      const modelURL = URL + "model.json";
+      const metadataURL = URL + "metadata.json";
+
+      model = await tmPose.load(modelURL, metadataURL);
+      maxPredictions = model.getTotalClasses();
+
+      // Identifica dinamicamente os nomes das classes
+      const classNames = model.getClassLabels();
+      console.log("📸 Classes detectadas:", classNames);
+      labelContainer = document.getElementById("label-container");
+      labelContainer.innerHTML = "<strong>Classes detectadas:</strong><br>" + classNames.join(", ");
+
+      // define as classes automaticamente
+      CLASS_SIM = classNames.find(c => c.toLowerCase().includes("sim")) || classNames[0];
+      CLASS_NAO = classNames.find(c => c.toLowerCase().includes("nao") || c.toLowerCase().includes("não")) || classNames[1];
+
+      console.log("✅ Mapeamento -> SIM:", CLASS_SIM, " | NÃO:", CLASS_NAO);
+
+      const size = 200;
+      const flip = true;
+      webcam = new tmPose.Webcam(size, size, flip);
+      await webcam.setup();
+      await webcam.play();
+
+      canvasEl = document.getElementById("canvas");
+      canvasEl.width = size;
+      canvasEl.height = size;
+      ctx = canvasEl.getContext("2d");
+
+      window.requestAnimationFrame(loop);
+      showQuestion();
+    }
+
+    async function loop() {
+      webcam.update();
+      await predict();
+
+      if (webcam && webcam.canvas && ctx && canvasEl) {
+        ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+        ctx.drawImage(webcam.canvas, 0, 0, canvasEl.width, canvasEl.height);
+      }
+
+      window.requestAnimationFrame(loop);
+    }
+
+    async function predict() {
+      if (!model || !webcam) return;
+
+      const { posenetOutput } = await model.estimatePose(webcam.canvas);
+      const prediction = await model.predict(posenetOutput);
+
+      let simConfidence = 0;
+      let naoConfidence = 0;
+
+      for (let i = 0; i < prediction.length; i++) {
+        const cls = prediction[i].className;
+        const prob = prediction[i].probability;
+
+        if (cls === CLASS_SIM) simConfidence = prob;
+        if (cls === CLASS_NAO) naoConfidence = prob;
+      }
+
+      document.getElementById("label-container").innerHTML =
+        `<strong>${CLASS_SIM}:</strong> ${(simConfidence * 100).toFixed(1)}%<br>` +
+        `<strong>${CLASS_NAO}:</strong> ${(naoConfidence * 100).toFixed(1)}%`;
+
+      if (simConfidence >= CONFIDENCE_THRESHOLD && simConfidence > naoConfidence) {
+        answersDuringTimer.push("SIM");
+      } else if (naoConfidence >= CONFIDENCE_THRESHOLD && naoConfidence > simConfidence) {
+        answersDuringTimer.push("NÃO");
+      }
+    }
+
+    function startTimer() {
+      if (timerId) clearTimeout(timerId);
+      answersDuringTimer.length = 0;
+
+      let timeLeft = TRANSITION_TIME_MS / 1000;
+      const intervalId = setInterval(() => {
+        document.getElementById("feedback").innerText = `Responda agora! ${timeLeft}s restantes.`;
+        timeLeft--;
+        if (timeLeft < 0) {
+          clearInterval(intervalId);
+          processDebouncedAnswer();
+        }
+      }, 1000);
+    }
+
+    function processDebouncedAnswer() {
+      if (answersDuringTimer.length === 0) {
+        lastDetectedAnswer = null;
+      } else {
+        const simCount = answersDuringTimer.filter(a => a === "SIM").length;
+        const naoCount = answersDuringTimer.filter(a => a === "NÃO").length;
+        lastDetectedAnswer = simCount > naoCount ? "SIM" : "NÃO";
+      }
+
+      advanceQuestion();
+    }
+
+    function advanceQuestion() {
+      if (lastDetectedAnswer === "SIM") positiveAnswers++;
+      else negativeAnswers++;
+
+      const text = lastDetectedAnswer
+        ? `Resposta registrada: ${lastDetectedAnswer}`
+        : "Resposta não detectada (contado como NÃO)";
+      document.getElementById("feedback").innerText = text;
+
+      questionIndex++;
+      setTimeout(showQuestion, 500);
+    }
+
+    function showQuestion() {
+      if (questionIndex < questions.length) {
+        const q = questions[questionIndex];
+        const container = document.getElementById("question-container");
+        container.style.opacity = 0;
+
+        setTimeout(() => {
+          container.innerText = `Pergunta ${questionIndex + 1}: ${q.text}`;
+          document.getElementById("question-counter").innerText = `Pergunta ${questionIndex + 1} de ${questions.length}`;
+          container.style.opacity = 1;
+          updateProgressBar();
+          startTimer();
+        }, 300);
+      } else {
+        showPopup();
+      }
+    }
+
+    function updateProgressBar() {
+      const percent = (questionIndex / questions.length) * 100;
+      document.getElementById("progress-bar").style.width = `${percent}%`;
+    }
+
+    function showPopup() {
+      const title = document.getElementById("popup-title");
+      const msg = document.getElementById("popup-message");
+      const overlay = document.getElementById("overlay");
+      const popup = document.getElementById("popup");
+
+      if (positiveAnswers >= 3) {
+        title.innerText = "🎉 Parabéns!";
+        msg.innerHTML = "Você é uma <strong>Esmerilhadeira Angular Makita 115mm 840w 220v</strong>!";
+      } else {
+        title.innerText = "😅 Que pena...";
+        msg.innerHTML = "Você é um <strong>humano</strong>. Mas humanos também fazem coisas incríveis!";
+      }
+
+      overlay.style.display = "block";
+      popup.style.display = "block";
+    }
+
+    function restartQuiz() {
+      questionIndex = 0;
+      positiveAnswers = 0;
+      negativeAnswers = 0;
+      lastDetectedAnswer = null;
+      document.getElementById("overlay").style.display = "none";
+      document.getElementById("popup").style.display = "none";
+      showQuestion();
+    }
+  </script>
+</body>
+</html>
